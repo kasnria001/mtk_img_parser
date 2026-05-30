@@ -27,3 +27,7 @@ Supports ARM64/ARM32 architecture detection and policy_part_map parsing.
 ```
 Usage: python parse_mtk_certs.py <image_file>
 ```
+
+```
+Usage: parse_da.py <da_file>
+```
