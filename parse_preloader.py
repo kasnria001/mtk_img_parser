@@ -148,20 +148,20 @@ def detect_image_type(data):
 
 def detect_architecture(data_section):
     """
-    Detect ARM64 or ARM32 by analyzing the instruction bytes at the preloader entry point.
-    
-    ARM64 entry characteristics:
-      - 0xD5: SMC / BRK instructions (common entry: 0xD503201F = NOP)
-      - 0xD6: System instructions (0xD65F0000 = RET)
-      - 0x14: Unconditional branch
-      - 0x58: LDR immediate
-    
-    ARM32 entry characteristics:
-      - 0x47: Thumb instructions (BX, CBZ, etc.)
-      - 0xE1: ARM instructions (MOV, BX, etc.)
-      - 0x46: Thumb instructions (MOV, etc.)
-    
-    Fallback: search for "EMMC" / "UFS" strings
+    Detect ARM64 or ARM32 by analyzing the first instruction at the preloader entry point.
+
+    Both ARM64 and ARM32 preloader entry points typically start with `b resethandler`,
+    but the encoding differs:
+      - ARM64 `B` : 0b0_001010_imm26  → first byte 0x14
+      - ARM32 `B` : 0b1110_1010_imm24 → first byte 0xEA
+      - Thumb `B` : 0b11100_imm8      → first byte 0xE0
+
+    Detection priority:
+      1. ARM32 `B` / Thumb `B` (0xEA / 0xE0) — most common ARM32 entry
+      2. ARM64 `B` / `BL` (0x14 / 0x94) — most common ARM64 entry
+      3. ARM64 `NOP` / system (0xD5 / 0xD6)
+      4. GFH jump_offset heuristic
+      5. Default: ARM32
     """
     if len(data_section) < 4:
         return False  # data too short, default to ARM32
@@ -169,29 +169,21 @@ def detect_architecture(data_section):
     first_instr = struct.unpack_from("<I", data_section, 0)[0]
     first_byte = first_instr & 0xFF
 
-    # ARM64 detection
-    if first_byte == 0xD5:  # SMC / BRK (common entry: D503201F = NOP)
-        return True
-    if first_byte == 0xD6:  # System instruction (D65F0000 = RET)
-        return True
-    if first_byte == 0x14:  # Unconditional branch
-        return True
-    if first_byte == 0x58:  # LDR immediate
-        return True
-
-    # ARM32 detection
-    if first_byte == 0x47:  # Thumb instruction
+    # --- ARM32 detection (higher priority: ARM32 `B` is very distinctive) ---
+    if first_byte == 0xEA:  # ARM `B` (unconditional branch): 0b1110_1010_imm24
         return False
-    if first_byte == 0xE1:  # ARM instruction
-        return False
-    if first_byte == 0x46:  # Thumb instruction
+    if first_byte == 0xE0:  # Thumb `B` (unconditional branch): 0b11100_imm8
         return False
 
-    # Fallback: search for EMMC/UFS strings in the image
-    for i in range(0, len(data_section) - 4, 4):
-        chunk = data_section[i:i + 4]
-        if chunk in (b'EMMC', b'UFS\0', b'\0UFS'):
-            return True  # found architecture marker string, assume ARM64
+    # --- ARM64 detection ---
+    # ARM64 `B`/`BL` instruction: bits [31:26] = 0b0_00101 (B) or 0b1_00101 (BL)
+    # Mask 0xFC000000 isolates bits [31:26], result 0x14000000 matches both B and BL
+    if (first_instr & 0xFC000000) == 0x14000000:  # ARM64 `B` or `BL`
+        return True
+    if first_byte == 0xD5:  # ARM64 system instruction (NOP = 0xD503201F)
+        return True
+    if first_byte == 0xD6:  # ARM64 system instruction (RET = 0xD65F03C0)
+        return True
 
     return False  # default ARM32
 
@@ -423,7 +415,9 @@ def resolve_policy_part_map(raw_data, data_block_load_addr,
             return extract_string(raw_data, addr, data_block_load_addr, data_block_file_start)
 
         name1, ok1 = get_part_name(part_name1_addr)
-        if("NULL" in name1):
+        
+
+        if(name1 is not None and "NULL" in name1):
             break
         # print(part_name2_addr)
         name2, ok2 = get_part_name(part_name2_addr)
@@ -505,64 +499,152 @@ def print_policy_entries(entries, is_arm64):
 # res_mem_info parsing (ARM64)
 # ═══════════════════════════════════════════════
 
-RES_MEM_INFO_SIG = 0xDEADDEAD
 RES_MEM_INFO_STRUCT_SIZE = 0x28
 
 
-def find_deaddead(data_block, data_block_file_start, raw_data):
+def find_res_mem_info(data_block, data_block_load_addr,
+                      data_block_file_start, raw_data, is_arm64):
     """
-    Search for the 0xDEADDEAD marker in the data block.
-    Returns its file offset in the raw data, or None if not found.
-    """
-    target = struct.pack("<I", RES_MEM_INFO_SIG)
-    idx = data_block.find(target)
-    if idx == -1:
-        return None
+    Locate the res_mem_info structure array by searching for the "BL33-reserved\0"
+    string pointer within the data block.
 
-    file_offset = data_block_file_start + idx
-    if file_offset >= len(raw_data):
-        return None
-    return file_offset
+    Algorithm:
+      1. Find "BL33-reserved\0" string in the data block
+      2. Calculate its memory address: data_block_load_addr + offset_in_data_block
+      3. Convert the address to a byte stream (little-endian, 8 bytes for ARM64)
+      4. Search for that byte stream in the data block — this finds the location
+         where a res_mem_info entry's name pointer points to "BL33-reserved"
+      5. From that hit, search backward to find the start of the res_mem_info array
+         and forward to find the end
+      6. Return (array_file_offset, count) or (None, 0) on failure
+
+    Args:
+        data_block:            The data block bytes
+        data_block_load_addr:  Data block load address (IDA load address)
+        data_block_file_start: Start file offset of the data block
+        raw_data:              Full raw file data
+        is_arm64:              Whether it's ARM64
+
+    Returns:
+        (array_file_offset, entry_count) or (None, 0)
+    """
+    if not is_arm64:
+        return None, 0
+
+    # Step 1: Find "BL33-reserved\0" in the data block
+    target_str = b'BL33-reserved\x00'
+    str_idx = data_block.find(target_str)
+    if str_idx == -1:
+        return None, 0
+
+    # Step 2: Calculate the memory address of the string
+    str_mem_addr = data_block_load_addr + str_idx
+
+    # Step 3: Convert address to byte stream (little-endian, 8 bytes for ARM64)
+    addr_bytes = struct.pack('<Q', str_mem_addr)
+
+    # Step 4: Search for the address byte stream in the data block
+    # This finds where a res_mem_info entry stores its name pointer to "BL33-reserved"
+    # Start searching from the beginning of the data block up to the string location
+    search_end = str_idx  # no need to search past the string itself
+    ptr_idx = data_block.find(addr_bytes, 0, search_end)
+
+    if ptr_idx == -1:
+        # Try searching in the full data block in case the pointer is after the string
+        ptr_idx = data_block.find(addr_bytes)
+        if ptr_idx == -1:
+            return None, 0
+
+    # ptr_idx is within the data block, at the "name" field of some res_mem_info entry.
+    # The name field is at offset 0 within each 0x28-byte entry.
+    # So the entry start = ptr_idx (aligned to struct boundary — name is the first field).
+
+    # Step 5: Search backward to find the start of the res_mem_info array.
+    # Walk back in 0x28-byte steps. At each position, check if the name pointer
+    # resolves to a valid string. Keep going until we find an invalid one.
+    entry_size = RES_MEM_INFO_STRUCT_SIZE
+
+    # The hit is at some entry — we know it's valid (it points to "BL33-reserved").
+    # Walk backward from the hit to find the first entry.
+    array_start = ptr_idx  # relative to data block
+
+    probe = ptr_idx - entry_size
+    while probe >= 0:
+        probe_file = data_block_file_start + probe
+        if probe_file + 8 > len(raw_data):
+            break
+        name_ptr = read_u64(raw_data, probe_file)
+        name_str, name_ok = extract_string(
+            raw_data, name_ptr, data_block_load_addr, data_block_file_start, max_len=64)
+        if not name_ok or name_str is None or name_str == "":
+            break
+        array_start = probe
+        probe -= entry_size
+
+    # Step 6: Search forward from the hit to find the end of the array.
+    # Walk forward in 0x28-byte steps. At each position, check if the name pointer
+    # resolves to a valid string. Stop at the first invalid entry.
+    probe = array_start
+    count = 0
+    while probe + entry_size <= len(data_block):
+        probe_file = data_block_file_start + probe
+        if probe_file + 8 > len(raw_data):
+            break
+        name_ptr = read_u64(raw_data, probe_file)
+        name_str, name_ok = extract_string(
+            raw_data, name_ptr, data_block_load_addr, data_block_file_start, max_len=64)
+        if not name_ok or name_str is None or name_str == "":
+            break
+        count += 1
+        probe += entry_size
+
+    if count == 0:
+        return None, 0
+
+    array_file_offset = data_block_file_start + array_start
+    return array_file_offset, count
 
 
 def parse_res_mem_info(raw_data, data_block_load_addr,
-                       sig_file_offset, data_block_file_start,
-                       data_block_file_end, is_arm64):
+                       data_block_file_start, data_block_file_end,
+                       is_arm64):
     """
     Parse the res_mem_info structure array.
     Valid only for ARM64.
 
-    Algorithm:
-      1. sig_file_offset points to 0xDEADDEAD
-      2. Offset +0x10 gives the start of the res_mem_info array
-      3. Parse entries of size 0x28 bytes each:
-         - name:     8 bytes (char*, address in ida_load_addr address space)
-         - start:    8 bytes (unsigned __int64)
-         - size:     8 bytes (unsigned __int64)
-         - align:    8 bytes (unsigned __int64)
-         - mapping:  4 bytes (unsigned int)
-         - padding:  4 bytes
-      4. For each entry, try to convert the name pointer to a file offset and extract a string;
-         if a non-empty string is obtained, the entry is valid
-      5. If the name address cannot be resolved to a valid string, parsing stops
+    Uses the "BL33-reserved\0" string pointer search method to locate the array,
+    then parses entries of size 0x28 bytes each:
+      - name:     8 bytes (char*, address in ida_load_addr address space)
+      - start:    8 bytes (unsigned __int64)
+      - size:     8 bytes (unsigned __int64)
+      - align:    8 bytes (unsigned __int64)
+      - mapping:  4 bytes (unsigned int)
+      - padding:  4 bytes
     """
     if not is_arm64:
         print("Info: res_mem_info is only parsed for ARM64")
         return
 
-    if sig_file_offset is None:
-        print("Info: 0xDEADDEAD marker not found")
-        return
+    data_block = raw_data[data_block_file_start:data_block_file_end]
 
-    array_file_offset = sig_file_offset + 0x10
+    array_file_offset, entry_count = find_res_mem_info(
+        data_block, data_block_load_addr,
+        data_block_file_start, raw_data, is_arm64
+    )
+
+    if array_file_offset is None:
+        print("Info: res_mem_info not found (BL33-reserved string or pointer not found)")
+        print()
+        return
 
     # Print header information
     print("-" * 60)
     print("  res_mem_info (Memory Region Information)")
     print("-" * 60)
     print()
-    print(f"  Signature Offset : 0x{sig_file_offset:X}")
+    print(f"  Found via        : BL33-reserved string pointer search")
     print(f"  Array Offset     : 0x{array_file_offset:X}")
+    print(f"  Entry Count      : {entry_count}")
     print()
 
     # Table header
@@ -576,7 +658,10 @@ def parse_res_mem_info(raw_data, data_block_load_addr,
     entries = []
     offset = array_file_offset
 
-    while offset + RES_MEM_INFO_STRUCT_SIZE <= data_block_file_end:
+    for _ in range(entry_count):
+        if offset + RES_MEM_INFO_STRUCT_SIZE > data_block_file_end:
+            break
+
         # Read name pointer (8 bytes)
         name_ptr = read_u64(raw_data, offset)
 
@@ -584,7 +669,6 @@ def parse_res_mem_info(raw_data, data_block_load_addr,
         name_str, name_ok = extract_string(
             raw_data, name_ptr, data_block_load_addr, data_block_file_start, max_len=64)
 
-        # If name is invalid or not a string, end parsing
         if not name_ok or name_str is None or name_str == "":
             break
 
@@ -729,10 +813,9 @@ def main():
         print_policy_entries(parsed_entries, is_arm64)
 
     # 8. Parse res_mem_info (ARM64 only)
-    deaddead_offset = find_deaddead(data_section, data_block_file_start, data)
+    # Uses "BL33-reserved\0" string pointer search to locate the structure
     parse_res_mem_info(
         data, ida_load_addr,
-        deaddead_offset,
         data_block_file_start,
         data_block_file_end,
         is_arm64
